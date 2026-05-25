@@ -111,10 +111,23 @@ export const downloadAttachment = asyncHandler(async (req: AuthenticatedRequest,
   const attachment = await taskService.getAttachment(taskId, attachmentId);
 
   if (attachment.url.includes('/uploads/')) {
-    const filename = attachment.url.substring(attachment.url.lastIndexOf('/') + 1);
+    const filename = decodeURIComponent(attachment.url.substring(attachment.url.lastIndexOf('/') + 1));
     const safeName = path.basename(filename);
     const filePath = path.join(__dirname, '../../uploads', safeName);
-    return res.download(filePath, attachment.name);
+    
+    // Dynamically check if the local file exists on disk
+    const fs = require('fs');
+    if (fs.existsSync(filePath)) {
+      return res.download(filePath, attachment.name);
+    } else {
+      // If the file was transferred to Cloudinary and deleted from disk, load the refreshed task
+      // context and redirect the user's browser directly to the Cloudinary secure URL!
+      const refreshedTask = await taskService.getTaskDetails(taskId);
+      const refreshedAttachment = refreshedTask.attachments.find((a: any) => a._id.toString() === attachmentId);
+      if (refreshedAttachment && !refreshedAttachment.url.includes('/uploads/')) {
+        return res.redirect(refreshedAttachment.url);
+      }
+    }
   }
 
   return res.redirect(attachment.url);

@@ -30,6 +30,7 @@ app.set('etag', false);
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: 'cross-origin' }, // Crucial for serving uploaded file resources locally to the react app
+    crossOriginOpenerPolicy: { policy: 'unsafe-none' }, // Allows cross-origin opener windows (e.g., from client port 5173 to backend port 5000)
   })
 );
 
@@ -81,10 +82,15 @@ function escapeRegExp(value: string): string {
 }
 
 async function authorizeUploadedFile(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const filename = path.basename(req.path);
+  const filename = decodeURIComponent(path.basename(req.path));
+  
+  // Find which task owns this file attachment
   const task = await Task.findOne({
-    'attachments.url': { $regex: `${escapeRegExp(filename)}$` },
-  }).select('projectId').lean();
+    $or: [
+      { 'attachments.url': { $regex: `${escapeRegExp(filename)}$` } },
+      { 'attachments.name': filename }
+    ]
+  }).select('projectId attachments').lean();
 
   if (!task) {
     return res.status(404).json({ success: false, message: 'File not found.' });
@@ -93,6 +99,19 @@ async function authorizeUploadedFile(req: AuthenticatedRequest, res: Response, n
   const isMember = await projectRepository.isUserMember(task.projectId.toString(), req.user!.id);
   if (!isMember) {
     return res.status(403).json({ success: false, message: 'Access denied for this file.' });
+  }
+
+  // If the file is requested locally but has already been transferred to Cloudinary and deleted from local disk,
+  // dynamically redirect the user to the secure Cloudinary asset!
+  const fs = require('fs');
+  const filePath = path.join(UPLOADS_PATH, filename);
+  if (!fs.existsSync(filePath)) {
+    const attachment = task.attachments.find((att: any) => 
+      att.url.endsWith(filename) || att.name === filename
+    );
+    if (attachment && !attachment.url.includes('/uploads/')) {
+      return res.redirect(attachment.url);
+    }
   }
 
   next();

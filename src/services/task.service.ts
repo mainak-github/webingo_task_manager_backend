@@ -29,6 +29,9 @@ export class TaskService {
       if (!project) {
         throw new NotFoundError('Project not found.');
       }
+      if (project.status === 'archived') {
+        throw new BadRequestError('Archived project: task cannot be created under this project. First remove this from archive.');
+      }
 
       const creatorRole = await projectRepository.getUserRoleInProject(projectId, creatorId);
       this.assertCanCreateTask(creatorRole, taskData, creatorId);
@@ -94,6 +97,7 @@ export class TaskService {
       }
 
       const projectId = existingTask.projectId.toString();
+      await this.assertProjectNotArchived(projectId);
       const updaterRole = await projectRepository.getUserRoleInProject(projectId, updaterId);
       this.assertCanUpdateTask(updaterRole, existingTask, updaterId);
 
@@ -184,6 +188,7 @@ export class TaskService {
       }
 
       const projectId = task.projectId.toString();
+      await this.assertProjectNotArchived(projectId);
 
       // Clean up attachment storage files
       if (task.attachments && task.attachments.length > 0) {
@@ -211,6 +216,7 @@ export class TaskService {
   // BULK OPERATIONS
   async bulkUpdateStatus(projectId: string, taskIds: string[], status: string, actorId: string): Promise<number> {
     return logger.profile('TaskService.bulkUpdateStatus', async () => {
+      await this.assertProjectNotArchived(projectId);
       const modifiedCount = await taskRepository.bulkUpdateStatus(projectId, taskIds, status, actorId);
       
       // Invalidate caches
@@ -234,6 +240,7 @@ export class TaskService {
 
   async bulkAssign(projectId: string, taskIds: string[], assigneeIds: string[], actorId: string): Promise<number> {
     return logger.profile('TaskService.bulkAssign', async () => {
+      await this.assertProjectNotArchived(projectId);
       const modifiedCount = await taskRepository.bulkAssign(projectId, taskIds, assigneeIds, actorId);
 
       // Invalidate caches
@@ -257,6 +264,7 @@ export class TaskService {
 
   async bulkDelete(projectId: string, taskIds: string[], actorId: string): Promise<number> {
     return logger.profile('TaskService.bulkDelete', async () => {
+      await this.assertProjectNotArchived(projectId);
       // Find all tasks to delete attachments
       const TaskModel = require('../models/Task').Task;
       const tasks = await TaskModel.find({ _id: { $in: taskIds }, projectId });
@@ -296,6 +304,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       // 1. Instantly generate a local static serve URL (<1ms)
       const fileType = path.extname(file.originalname).toLowerCase();
@@ -388,6 +397,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       const attachment = task.attachments.find(a => a._id.toString() === attachmentId);
       if (!attachment) {
@@ -487,6 +497,12 @@ export class TaskService {
 
   async addComment(taskId: string, text: string, authorId: string): Promise<ITask> {
     return logger.profile('TaskService.addComment', async () => {
+      const task = await Task.findById(taskId).lean();
+      if (!task) {
+        throw new NotFoundError('Task not found.');
+      }
+      await this.assertProjectNotArchived(task.projectId.toString());
+
       const updatedTask = await Task.findByIdAndUpdate(
         taskId,
         {
@@ -566,6 +582,12 @@ export class TaskService {
 
   async deleteComment(taskId: string, commentId: string, actorId: string): Promise<ITask> {
     return logger.profile('TaskService.deleteComment', async () => {
+      const task = await Task.findById(taskId).lean();
+      if (!task) {
+        throw new NotFoundError('Task not found.');
+      }
+      await this.assertProjectNotArchived(task.projectId.toString());
+
       const updatedTask = await Task.findByIdAndUpdate(
         taskId,
         {
@@ -600,6 +622,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       if (task.timerStartedAt) {
         throw new BadRequestError('Timer is already running on this task.');
@@ -650,6 +673,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       if (!task.timerStartedAt) {
         throw new BadRequestError('Timer is not running on this task.');
@@ -701,6 +725,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       if (task.timerStartedAt) {
         throw new BadRequestError('Timer is already running on this task.');
@@ -750,6 +775,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       task.timerStartedAt = undefined;
       task.pausedSeconds = 0;
@@ -796,6 +822,7 @@ export class TaskService {
       if (!task) {
         throw new NotFoundError('Task not found.');
       }
+      await this.assertProjectNotArchived(task.projectId.toString());
 
       let elapsedSeconds = 0;
       if (task.timerStartedAt) {
@@ -868,6 +895,16 @@ export class TaskService {
         await task.save();
       }
     });
+  }
+
+  private async assertProjectNotArchived(projectId: string): Promise<void> {
+    const project = await projectRepository.findById(projectId, false);
+    if (!project) {
+      throw new NotFoundError('Project not found.');
+    }
+    if (project.status === 'archived') {
+      throw new BadRequestError('Archived project: task cannot be created under this project. First remove this from archive.');
+    }
   }
 
   private assertCanCreateTask(role: Role | null, taskData: Partial<ITask>, userId: string): void {
