@@ -6,6 +6,7 @@ dist/
 
 # Environment and secrets
 .env
+.env.example
 .env.local
 
 # Runtime uploads and logs
