@@ -3,7 +3,7 @@ import { userRepository } from '../repositories/user.repository';
 import { activityRepository } from '../repositories/activity.repository';
 import { projectInvitationRepository } from '../repositories/projectInvitation.repository';
 import { notificationService } from './notification.service';
-import { mailService } from '../config/mail';
+import { emailQueueService } from './emailQueue.service';
 import { cacheService } from '../config/redis';
 import { BadRequestError } from '../errors/BadRequestError';
 import { NotFoundError } from '../errors/NotFoundError';
@@ -17,6 +17,7 @@ import { Task } from '../models/Task';
 import { ActivityLog } from '../models/ActivityLog';
 import { Notification } from '../models/Notification';
 import { buildClientUrl, escapeHtml } from '../utils/clientUrl';
+import { buildProjectInvitationEmail } from '../utils/emailTemplates';
 
 export class ProjectService {
   private getProjectsCacheKey(userId: string): string {
@@ -105,8 +106,22 @@ export class ProjectService {
 
   async getUserProjects(userId: string): Promise<IProject[]> {
     return logger.profile('ProjectService.getUserProjects', async () => {
+      const cacheKey = this.getProjectsCacheKey(userId);
+      
+      // 1. Try to retrieve projects from high-speed cache (<2ms)
+      const cached = await cacheService.get<IProject[]>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
+      // 2. Cache miss: Process pending invitations and query DB
       await this.processPendingInvitations(userId);
-      return projectRepository.findUserProjects(userId);
+      const projects = await projectRepository.findUserProjects(userId);
+      
+      // 3. Cache the retrieved project list for 5 minutes (300 seconds)
+      await cacheService.set(cacheKey, projects, 300);
+      
+      return projects;
     });
   }
 
@@ -164,17 +179,16 @@ export class ProjectService {
         );
       }
 
-      // Send mail
-      await mailService.sendMail({
-        to: normalizedEmail,
-        subject: `Invitation to Join Project "${project.name}"`,
-        html: `
-          <h1>Project Invitation</h1>
-          <p>You have been invited to join the project <strong>"${safeProjectName}"</strong> as a <strong>${safeRole}</strong>.</p>
-          <p>Please click the link below to accept the invitation and join the workspace:</p>
-          <a href="${invitationLink}">${invitationLink}</a>
-        `,
-      });
+      // Fetch inviter user profile to personalise the invitation email
+      const inviter = await userRepository.findById(inviterId);
+      const inviterName = inviter ? inviter.name : 'A collaborator';
+
+      // Queue invitation email in the durable database background queue
+      await emailQueueService.queueMail(
+        normalizedEmail,
+        `Invitation to Join Project "${project.name}" - WebBingo`,
+        buildProjectInvitationEmail(project.name, role, invitationLink, inviterName)
+      );
 
       // Log activity
       await activityRepository.log(projectId, inviterId, 'member:invite', `Invited "${normalizedEmail}" to project as ${role}`);

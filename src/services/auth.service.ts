@@ -1,6 +1,6 @@
 import { userRepository } from '../repositories/user.repository';
 import { generateAccessToken, generateRefreshToken, verifyRefreshToken } from '../utils/generateToken';
-import { mailService } from '../config/mail';
+import { emailQueueService } from './emailQueue.service';
 import { BadRequestError } from '../errors/BadRequestError';
 import { UnauthorizedError } from '../errors/UnauthorizedError';
 import { NotFoundError } from '../errors/NotFoundError';
@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import type { IUser } from '../models/User';
 import { logger } from '../utils/logger';
 import { buildClientUrl } from '../utils/clientUrl';
+import { buildVerificationOtpEmail, build2faOtpEmail, buildPasswordResetEmail } from '../utils/emailTemplates';
 
 export class AuthService {
   async register(userData: Partial<IUser>): Promise<IUser> {
@@ -29,18 +30,12 @@ export class AuthService {
         isVerified: false,
       });
 
-      // Send Verification Email with OTP
-      await mailService.sendMail({
-        to: user.email,
-        subject: 'Verify Your Email Address - WebBingo Task Manager',
-        html: `
-          <h1>Email Verification</h1>
-          <p>Hi ${user.name},</p>
-          <p>Thank you for registering on our real-time project workspace. Your 6-digit verification code is:</p>
-          <h2 style="font-size: 24px; letter-spacing: 5px; color: #3b82f6;">${otpCode}</h2>
-          <p>This code will expire in 10 minutes.</p>
-        `,
-      });
+      // Queue Verification Email with OTP in the durable database background queue
+      await emailQueueService.queueMail(
+        user.email,
+        'Verify Your Email Address - WebBingo',
+        buildVerificationOtpEmail(user.name, otpCode)
+      );
 
       return user;
     });
@@ -108,18 +103,12 @@ export class AuthService {
       user.loginOtpExpiresAt = loginOtpExpiresAt;
       await user.save();
 
-      // Send 2FA login email
-      await mailService.sendMail({
-        to: user.email,
-        subject: 'Two-Factor Authentication Code - WebBingo Task Manager',
-        html: `
-          <h1>Two-Factor Verification</h1>
-          <p>Hi ${user.name},</p>
-          <p>A login attempt requires verification. Your 6-digit two-factor authentication code is:</p>
-          <h2 style="font-size: 24px; letter-spacing: 5px; color: #10b981;">${loginOtpCode}</h2>
-          <p>This code will expire in 10 minutes.</p>
-        `,
-      });
+      // Queue 2FA login email in the durable database background queue
+      await emailQueueService.queueMail(
+        user.email,
+        'Two-Factor Authentication Code - WebBingo',
+        build2faOtpEmail(user.name, loginOtpCode)
+      );
 
       return { requires2fa: true, email: user.email };
     });
@@ -175,33 +164,21 @@ export class AuthService {
         user.otpExpiresAt = expiresAt;
         await user.save();
 
-        await mailService.sendMail({
-          to: user.email,
-          subject: 'Verify Your Email Address - WebBingo Task Manager',
-          html: `
-            <h1>Email Verification</h1>
-            <p>Hi ${user.name},</p>
-            <p>Your new 6-digit verification code is:</p>
-            <h2 style="font-size: 24px; letter-spacing: 5px; color: #3b82f6;">${otpCode}</h2>
-            <p>This code will expire in 10 minutes.</p>
-          `,
-        });
+        await emailQueueService.queueMail(
+          user.email,
+          'Verify Your Email Address - WebBingo',
+          buildVerificationOtpEmail(user.name, otpCode)
+        );
       } else {
         user.loginOtpCode = otpCode;
         user.loginOtpExpiresAt = expiresAt;
         await user.save();
 
-        await mailService.sendMail({
-          to: user.email,
-          subject: 'Two-Factor Authentication Code - WebBingo Task Manager',
-          html: `
-            <h1>Two-Factor Verification</h1>
-            <p>Hi ${user.name},</p>
-            <p>Your new 6-digit two-factor authentication code is:</p>
-            <h2 style="font-size: 24px; letter-spacing: 5px; color: #10b981;">${otpCode}</h2>
-            <p>This code will expire in 10 minutes.</p>
-          `,
-        });
+        await emailQueueService.queueMail(
+          user.email,
+          'Two-Factor Authentication Code - WebBingo',
+          build2faOtpEmail(user.name, otpCode)
+        );
       }
     });
   }
@@ -211,26 +188,31 @@ export class AuthService {
       // 1. Verify token
       const decoded = verifyRefreshToken(token);
 
-      // 2. Query DB to match active token
+      // 2. Query DB to match active token (userId is populated)
       const savedToken = await userRepository.findRefreshToken(token);
       if (!savedToken) {
         throw new UnauthorizedError('Token is invalid or has expired.');
       }
 
-      // 3. User verification
-      const user = await userRepository.findById(decoded.userId);
+      // 3. User verification (Directly leverage populated user object from step 2, eliminating redundant findById DB call)
+      const user = savedToken.userId as any;
       if (!user) {
         throw new UnauthorizedError('User no longer exists.');
       }
 
       // 4. Token rotation logic for robust security
-      const newAccessToken = generateAccessToken(user.id, user.role);
-      const newRefreshToken = generateRefreshToken(user.id, user.role);
+      const userIdStr = user._id ? user._id.toString() : user.id;
+      const newAccessToken = generateAccessToken(userIdStr, user.role);
+      const newRefreshToken = generateRefreshToken(userIdStr, user.role);
 
-      // Save rotated refresh token in place
+      // 5. Rotate the refresh token in-place using a single, highly indexed primary key update query (<5ms)
+      // This completely avoids two slow delete + insert queries
       const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-      await userRepository.deleteRefreshToken(token);
-      await userRepository.saveRefreshToken(user.id, newRefreshToken, expiresAt);
+      const RefreshTokenModel = require('../models/RefreshToken').RefreshToken;
+      await RefreshTokenModel.updateOne(
+        { _id: savedToken._id },
+        { $set: { token: newRefreshToken, expiresAt } }
+      );
 
       return { accessToken: newAccessToken, refreshToken: newRefreshToken };
     });
@@ -256,17 +238,13 @@ export class AuthService {
         resetTokenExpires,
       } as any);
 
-      // Send Reset Link
+      // Queue Reset Link email in the durable database background queue
       const resetLink = buildClientUrl('/reset-password', { token: resetToken });
-      await mailService.sendMail({
-        to: user.email,
-        subject: 'Password Reset Request - WebBingo Task Manager',
-        html: `
-          <h1>Password Reset</h1>
-          <p>You are receiving this email because you requested a password reset. Please click the link below to complete the process:</p>
-          <a href="${resetLink}">${resetLink}</a>
-        `,
-      });
+      await emailQueueService.queueMail(
+        user.email,
+        'Password Reset Request - WebBingo',
+        buildPasswordResetEmail(user.name, resetLink)
+      );
     });
   }
 

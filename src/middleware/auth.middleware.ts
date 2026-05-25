@@ -21,6 +21,8 @@ export async function protect(
 
     if (req.headers.authorization?.startsWith('Bearer')) {
       token = req.headers.authorization.split(' ')[1];
+    } else if (req.query?.token) {
+      token = req.query.token as string;
     } else if (req.cookies?.token) {
       token = req.cookies.token;
     }

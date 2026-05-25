@@ -28,6 +28,18 @@ jest.mock('../config/redis', () => ({
   },
 }));
 
+// Mock EmailQueueService globally so tests don't make real MongoDB/SMTP calls
+jest.mock('../services/emailQueue.service', () => ({
+  emailQueueService: {
+    queueMail: jest.fn().mockImplementation(() => Promise.resolve()),
+    processQueue: jest.fn().mockImplementation(() => Promise.resolve()),
+  },
+  default: {
+    queueMail: jest.fn().mockImplementation(() => Promise.resolve()),
+    processQueue: jest.fn().mockImplementation(() => Promise.resolve()),
+  },
+}));
+
 beforeAll(async () => {
   // Mock console.log and warn to keep Jest outputs clean
   jest.spyOn(console, 'log').mockImplementation(() => {});

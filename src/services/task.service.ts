@@ -13,6 +13,10 @@ import { logger } from '../utils/logger';
 import { Task, type ITask, type IAttachment } from '../models/Task';
 import type { Role } from '../constants/roles';
 import { Types } from 'mongoose';
+import { cloudinary, isCloudinaryConfigured } from '../config/cloudinary';
+import fs from 'fs';
+import path from 'path';
+import { env } from '../config/env';
 
 export class TaskService {
   private getAnalyticsCacheKey(projectId: string): string {
@@ -120,6 +124,37 @@ export class TaskService {
         task,
         actor: updaterId,
       });
+
+      // Determine what changed for the summary list and queue mail notifications
+      (async () => {
+        try {
+          const changes: string[] = [];
+          if (taskData.title && taskData.title !== existingTask.title) {
+            changes.push(`<li>Title changed to: <strong>${taskData.title}</strong></li>`);
+          }
+          if (taskData.status && taskData.status !== existingTask.status) {
+            changes.push(`<li>Status changed to: <strong>${taskData.status}</strong></li>`);
+          }
+          if (taskData.priority && taskData.priority !== existingTask.priority) {
+            changes.push(`<li>Priority changed to: <strong>${taskData.priority}</strong></li>`);
+          }
+          if (taskData.dueDate && new Date(taskData.dueDate).getTime() !== new Date(existingTask.dueDate || '').getTime()) {
+            changes.push(`<li>Due date changed to: <strong>${new Date(taskData.dueDate).toLocaleDateString()}</strong></li>`);
+          }
+          if (changes.length > 0) {
+            const changesHtml = `<ul>${changes.join('')}</ul>`;
+            const { buildTaskUpdatedEmail } = require('../utils/emailTemplates');
+            await this.notifyCollaborators(
+              task,
+              updaterId,
+              (recipientName, taskTitle, actorName) => buildTaskUpdatedEmail(recipientName, taskTitle, actorName, changesHtml, `${env.clientUrl}/tasks?projectId=${projectId}&taskId=${task._id}`),
+              `Task Updated: "${task.title}"`
+            );
+          }
+        } catch (err: any) {
+          console.error('[Email Queue Notification] Update error:', err.message);
+        }
+      })();
 
       // Send alert notifications if assignee list changed
       const oldAssignees = existingTask.assignees.map(id => id._id.toString());
@@ -262,31 +297,86 @@ export class TaskService {
         throw new NotFoundError('Task not found.');
       }
 
-      const uploadResult = await uploadService.uploadFile(file);
-      
+      // 1. Instantly generate a local static serve URL (<1ms)
+      const fileType = path.extname(file.originalname).toLowerCase();
+      const relativeUrl = `/uploads/${file.filename}`;
+      const localUrl = `${env.clientUrl.replace(':5173', ':5000')}${relativeUrl}`; // fallback local serve url
+
       const attachment: Partial<IAttachment> = {
-        name: uploadResult.name,
-        url: uploadResult.url,
-        type: uploadResult.type,
-        size: uploadResult.size,
+        name: file.originalname,
+        url: localUrl,
+        type: fileType,
+        size: file.size,
         uploadedBy: userId as any,
       };
 
+      // 2. Write record directly in MongoDB with the local URL
       const updatedTask = await taskRepository.addAttachment(taskId, attachment);
       if (!updatedTask) {
         throw new BadRequestError('Failed to add attachment.');
       }
 
       const projectId = updatedTask.projectId.toString();
+      
+      // Retrieve the freshly created attachment to get its Mongo ID
+      const dbAttachment = updatedTask.attachments[updatedTask.attachments.length - 1];
 
-      // Log activity
-      await activityRepository.log(projectId, userId, 'task:attachment_add', `Added file "${uploadResult.name}" to task "${updatedTask.title}"`);
+      // 3. Log activity
+      await activityRepository.log(projectId, userId, 'task:attachment_add', `Added file "${file.originalname}" to task "${updatedTask.title}"`);
 
-      // Broadcast Socket update event
+      // 4. Broadcast Socket event with the local URL so the UI updates instantly (<10ms)
       socketService.toRoom(projectId, SOCKET_EVENTS.TASK_UPDATED, {
         task: updatedTask,
         actor: userId,
       });
+
+      // Asynchronously trigger email notifications to collaborators
+      (async () => {
+        try {
+          const { buildNewAttachmentEmail } = require('../utils/emailTemplates');
+          await this.notifyCollaborators(
+            updatedTask,
+            userId,
+            (recipientName, taskTitle, actorName) => buildNewAttachmentEmail(recipientName, taskTitle, actorName, file.originalname, `${env.clientUrl}/tasks?projectId=${projectId}&taskId=${updatedTask._id}`),
+            `New Attachment on Task: "${updatedTask.title}"`
+          );
+        } catch (err: any) {
+          console.error('[Email Queue Notification] Attachment error:', err.message);
+        }
+      })();
+
+      // 5. Transfer to Cloudinary asynchronously in the background (no await block)
+      if (isCloudinaryConfigured) {
+        cloudinary.uploader.upload(file.path, {
+          folder: 'collaborative_project_assets',
+          resource_type: 'auto',
+        }).then(async (uploadResponse) => {
+          // In-place update in task attachments array
+          const TaskModel = require('../models/Task').Task;
+          await TaskModel.updateOne(
+            { _id: taskId, 'attachments._id': dbAttachment._id },
+            { $set: { 'attachments.$.url': uploadResponse.secure_url } }
+          );
+
+          // Fetch the updated task with fully populated fields
+          const fullyUpdatedTask = await taskRepository.findById(taskId);
+          if (fullyUpdatedTask) {
+            // Broadcast the new, permanent secure Cloudinary URL over sockets
+            socketService.toRoom(projectId, SOCKET_EVENTS.TASK_UPDATED, {
+              task: fullyUpdatedTask,
+              actor: userId,
+            });
+          }
+
+          // Clean up the temporary local file on the server
+          fs.unlink(file.path, (err) => {
+            if (err) console.error('[Upload] Failed to clean up temp file:', err);
+          });
+        }).catch((err) => {
+          console.error('[Upload] Background Cloudinary upload failed:', err.message);
+          // Fallback: stays served on local URL, which remains perfectly valid
+        });
+      }
 
       return updatedTask;
     });
@@ -397,28 +487,72 @@ export class TaskService {
 
   async addComment(taskId: string, text: string, authorId: string): Promise<ITask> {
     return logger.profile('TaskService.addComment', async () => {
-      const task = await Task.findById(taskId);
-      if (!task) {
+      const updatedTask = await Task.findByIdAndUpdate(
+        taskId,
+        {
+          $push: {
+            comments: {
+              text,
+              author: authorId as any,
+              createdAt: new Date(),
+            }
+          }
+        },
+        { new: true, runValidators: true }
+      )
+      .populate('assignees', 'name email role')
+      .populate('createdBy', 'name email')
+      .populate('updatedBy', 'name email')
+      .populate('comments.author', 'name email');
+
+      if (!updatedTask) {
         throw new NotFoundError('Task not found.');
       }
 
-      task.comments.push({
-        text,
-        author: authorId as any,
-        createdAt: new Date(),
-      } as any);
+      // Run mentions scanning and notification dispatches in the background asynchronously
+      (async () => {
+        try {
+          const matches = text.match(/@([a-zA-Z0-9_\-]+)/g);
+          if (matches && matches.length > 0) {
+            const UserModel = require('../models/User').User;
+            for (const match of matches) {
+              const username = match.replace('@', '').replace('_', ' ').trim();
+              // Find user by name (case-insensitive)
+              const mentionedUser = await UserModel.findOne({ name: { $regex: new RegExp(`^${username}$`, 'i') } }).lean();
+              if (mentionedUser) {
+                const mentionedUserId = mentionedUser._id.toString();
+                // Verify that the mentioned user is a member of the project workspace
+                const isMember = await projectRepository.isUserMember(updatedTask.projectId.toString(), mentionedUserId);
+                if (isMember && mentionedUserId !== authorId) {
+                  await notificationService.createNotification(
+                    mentionedUserId,
+                    updatedTask.projectId.toString(),
+                    'Mentioned in Comment',
+                    `You were mentioned in a comment on task "${updatedTask.title}": "${text}"`
+                  );
+                }
+              }
+            }
+          }
+        } catch (err: any) {
+          console.error('[Mentions Background Task] Error:', err.message);
+        }
+      })();
 
-      await task.save();
-
-      const updatedTask = await Task.findById(taskId)
-        .populate('assignees', 'name email role')
-        .populate('createdBy', 'name email')
-        .populate('updatedBy', 'name email')
-        .populate('comments.author', 'name email');
-
-      if (!updatedTask) {
-        throw new NotFoundError('Task not found after update.');
-      }
+      // Asynchronously trigger email notifications to collaborators
+      (async () => {
+        try {
+          const { buildNewCommentEmail } = require('../utils/emailTemplates');
+          await this.notifyCollaborators(
+            updatedTask,
+            authorId,
+            (recipientName, taskTitle, actorName) => buildNewCommentEmail(recipientName, taskTitle, actorName, text, `${env.clientUrl}/tasks?projectId=${updatedTask.projectId}&taskId=${updatedTask._id}`),
+            `New Comment on Task: "${updatedTask.title}"`
+          );
+        } catch (err: any) {
+          console.error('[Email Queue Notification] Comment error:', err.message);
+        }
+      })();
 
       // Broadcast Socket update event
       socketService.toRoom(updatedTask.projectId.toString(), SOCKET_EVENTS.TASK_UPDATED, {
@@ -432,27 +566,22 @@ export class TaskService {
 
   async deleteComment(taskId: string, commentId: string, actorId: string): Promise<ITask> {
     return logger.profile('TaskService.deleteComment', async () => {
-      const task = await Task.findById(taskId);
-      if (!task) {
-        throw new NotFoundError('Task not found.');
-      }
-
-      const commentIndex = task.comments.findIndex(c => c._id.toString() === commentId);
-      if (commentIndex === -1) {
-        throw new NotFoundError('Comment not found.');
-      }
-
-      task.comments.splice(commentIndex, 1);
-      await task.save();
-
-      const updatedTask = await Task.findById(taskId)
-        .populate('assignees', 'name email role')
-        .populate('createdBy', 'name email')
-        .populate('updatedBy', 'name email')
-        .populate('comments.author', 'name email');
+      const updatedTask = await Task.findByIdAndUpdate(
+        taskId,
+        {
+          $pull: {
+            comments: { _id: commentId }
+          }
+        },
+        { new: true }
+      )
+      .populate('assignees', 'name email role')
+      .populate('createdBy', 'name email')
+      .populate('updatedBy', 'name email')
+      .populate('comments.author', 'name email');
 
       if (!updatedTask) {
-        throw new NotFoundError('Task not found after update.');
+        throw new NotFoundError('Task not found.');
       }
 
       // Broadcast Socket update event
@@ -767,6 +896,73 @@ export class TaskService {
     }
 
     throw new BadRequestError('Insufficient permissions to update this task.');
+  }
+
+  private async notifyCollaborators(
+    task: any,
+    actorId: string,
+    emailBuilder: (recipientName: string, taskTitle: string, actorName: string) => string,
+    subject: string
+  ): Promise<void> {
+    try {
+      const UserModel = require('../models/User').User;
+      const actorQuery = UserModel.findById(actorId);
+      const actor = await (actorQuery.lean ? actorQuery.lean() : actorQuery);
+      const actorName = actor?.name || 'A collaborator';
+
+      const getCleanId = (val: any): string | null => {
+        if (!val) return null;
+        if (typeof val === 'object') {
+          const idVal = val._id || val.id || val;
+          return idVal ? idVal.toString() : null;
+        }
+        return val.toString();
+      };
+
+      const recipientIds = new Set<string>();
+      if (task.createdBy) {
+        const cleanCreatedBy = getCleanId(task.createdBy);
+        if (cleanCreatedBy) recipientIds.add(cleanCreatedBy);
+      }
+      if (task.assignees && task.assignees.length > 0) {
+        task.assignees.forEach((id: any) => {
+          const cleanAssignee = getCleanId(id);
+          if (cleanAssignee) recipientIds.add(cleanAssignee);
+        });
+      }
+
+      // Proactively notify all project workspace members to drive collaboration
+      try {
+        const ProjectModel = require('../models/Project').Project;
+        const cleanProjectId = getCleanId(task.projectId);
+        if (cleanProjectId) {
+          const project = await ProjectModel.findById(cleanProjectId).lean();
+          if (project && project.members) {
+            project.members.forEach((m: any) => {
+              const memberId = getCleanId(m.user);
+              if (memberId) recipientIds.add(memberId);
+            });
+          }
+        }
+      } catch (err: any) {
+        console.error('[Email Queue Notification] Project members fetch error:', err.message);
+      }
+
+      // Keep the actor in the recipientIds list so that the performing collaborator still receives validation copy emails in their inbox
+      // recipientIds.delete(actorId);
+
+      if (recipientIds.size === 0) return;
+
+      const recipients = await UserModel.find({ _id: { $in: Array.from(recipientIds) } }).lean();
+      const { emailQueueService } = require('./emailQueue.service');
+
+      for (const recipient of recipients) {
+        const html = emailBuilder(recipient.name, task.title, actorName);
+        await emailQueueService.queueMail(recipient.email, subject, html);
+      }
+    } catch (err: any) {
+      console.error('[Email Queue Notification] Error:', err.message);
+    }
   }
 }
 

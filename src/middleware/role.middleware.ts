@@ -1,6 +1,7 @@
 import type { Response, NextFunction } from 'express';
 import { projectRepository } from '../repositories/project.repository';
 import { taskRepository } from '../repositories/task.repository';
+import { Task } from '../models/Task';
 import { ForbiddenError } from '../errors/ForbiddenError';
 import { NotFoundError } from '../errors/NotFoundError';
 import type { AuthenticatedRequest } from './auth.middleware';
@@ -66,7 +67,7 @@ export function restrictToTaskRole(allowedRoles: Role[]) {
         return next(new ForbiddenError('Access Denied. Task ID is missing.'));
       }
 
-      const task = await taskRepository.findById(taskId);
+      const task = await Task.findById(taskId, 'projectId').lean();
       if (!task) {
         return next(new NotFoundError('Task not found.'));
       }

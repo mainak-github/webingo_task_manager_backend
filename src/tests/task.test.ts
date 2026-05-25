@@ -123,6 +123,7 @@ describe('Task Management API Endpoint Tests', () => {
       };
       (Task.findById as jest.Mock).mockReturnValue({
         populate: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
         then: jest.fn().mockImplementation(function (callback) {
           return Promise.resolve(mockTask).then(callback);
         }),
@@ -175,6 +176,7 @@ describe('Task Management API Endpoint Tests', () => {
       };
       (Task.findById as jest.Mock).mockReturnValue({
         populate: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
         then: jest.fn().mockImplementation(function (callback) {
           return Promise.resolve(mockTask).then(callback);
         }),
@@ -213,6 +215,7 @@ describe('Task Management API Endpoint Tests', () => {
       };
       (Task.findById as jest.Mock).mockReturnValue({
         populate: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
         then: jest.fn().mockImplementation(function (callback) {
           return Promise.resolve(mockTask).then(callback);
         }),

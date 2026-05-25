@@ -151,6 +151,7 @@ const TaskSchema = new Schema<ITask>(
 // Compound index for filtering tasks in Kanban boards efficiently
 TaskSchema.index({ projectId: 1, status: 1, priority: 1 });
 TaskSchema.index({ projectId: 1, dueDate: 1 });
+TaskSchema.index({ dueDate: 1, status: 1, dueDateNotified: 1 });
 
 export const Task = model<ITask>('Task', TaskSchema);
 export default Task;
